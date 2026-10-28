@@ -248,17 +248,71 @@ impl ToolContext<'_> {
         self.doc.hit_item(si, sp, self.tol(4.0)).map(|id| (sr, id))
     }
 
-    /// The frontmost text frame under `p`, looking inside groups. [`Self::hit`] stops at the
-    /// group, so a loaded text cursor over a text frame in a group found nothing to thread into
-    /// (gaps 27); InDesign threads into it.
-    pub fn hit_text_frame(&self, p: Point) -> Option<(SpreadRef, ItemId)> {
+    /// Frontmost unlocked non-group item under `p`, looking inside groups (`Shape::Group`).
+    pub fn hit_leaf(&self, p: Point) -> Option<(SpreadRef, ItemId)> {
         let (sr, id) = self.hit(p)?;
         let it = self.doc.item(id)?;
-        if it.is_text_frame() {
+        if !it.is_group() {
             return Some((sr, id));
         }
         let (_, sp) = self.layout.spread_at(p)?;
-        designcraft_doc::hit_descendant(it, sp, self.tol(4.0), &|c| c.is_text_frame()).map(|f| (sr, f))
+        let tol = self.tol(4.0);
+        fn descend(it: &Item, p: Point, tol: f64) -> Option<ItemId> {
+            if !designcraft_doc::edit_hit(it, p, tol) {
+                return None;
+            }
+            if it.is_group() {
+                let inner = it.xf.inverse() * p;
+                let children: Vec<_> = it.shown_children().collect();
+                for c in children.into_iter().rev() {
+                    if !c.hidden
+                        && !c.locked
+                        && let Some(id) = descend(c, inner, tol)
+                    {
+                        return Some(id);
+                    }
+                }
+                return None;
+            }
+            Some(it.id)
+        }
+        descend(it, sp, tol).map(|leaf| (sr, leaf))
+    }
+
+    /// The frontmost text frame under `p`, looking inside groups and through open paths/lines.
+    /// [`Self::hit`] stops at the group (or at a line drawn over a diagram), so a loaded text
+    /// cursor or Type tool click over a text frame in a group found nothing (gaps 27); InDesign
+    /// reaches the text frame.
+    pub fn hit_text_frame(&self, p: Point) -> Option<(SpreadRef, ItemId)> {
+        let (sr, sp) = self.layout.spread_at(p)?;
+        let tol = self.tol(4.0);
+        let spread = self.doc.spread(sr)?;
+        let mut items: Vec<&std::sync::Arc<Item>> = spread.items.iter().collect();
+        if matches!(sr, SpreadRef::Doc(_)) {
+            items.sort_by_key(|i| self.doc.layer_rank(i.layer));
+        }
+        for it in items.into_iter().rev() {
+            if matches!(sr, SpreadRef::Doc(_)) {
+                let layer = self.doc.layer(it.layer);
+                if it.hidden || layer.is_some_and(|l| !l.visible || l.locked) {
+                    continue;
+                }
+            } else if it.locked {
+                continue;
+            }
+            if !designcraft_doc::edit_hit(it, sp, tol) {
+                continue;
+            }
+            if let Some(id) = designcraft_doc::hit_descendant(it, sp, tol, &|c| c.is_text_frame()) {
+                return Some((sr, id));
+            }
+            // Open paths/lines (such as callout arrows over a diagram) do not block text frames
+            // behind them; closed non-group frames (placed graphics, empty or locked frames) do.
+            if !it.is_group() && it.path.is_closed() && it.shape != designcraft_doc::Shape::GraphicLine {
+                return None;
+            }
+        }
+        None
     }
 
     /// The parent item showing (not yet overridden) on the document page under `p`:

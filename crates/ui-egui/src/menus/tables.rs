@@ -155,6 +155,7 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "-",
             "cmd:type.createOutlines",
             "ui:app.findFontDialog",
+            "ui:app.addFontsDialog",
             "cmd:font.reload",
             ">Change Case",
             "cmd:type.changeCase|UPPERCASE|{\"case\": \"upper\"}",

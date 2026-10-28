@@ -7,6 +7,7 @@ use designcraft_ui_egui::{DesignApp, ImportRequest, ImportedFile, Inbox, Service
 use wasm_bindgen::JsCast as _;
 
 const DOC_EXTS: &[&str] = &["designcraft", "idml", "indd", "indt"];
+const FONT_EXTS: &[&str] = &["ttf", "otf", "ttc", "otc"];
 const IMAGE_EXTS: &[&str] = &[
     "png",
     "jpg",
@@ -57,6 +58,7 @@ pub fn start() {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
         let runner = eframe::WebRunner::new();
+        let startup_fonts = preload_web_fonts().await;
         let creator_graphics = graphics.clone();
         let result = runner
             .start(
@@ -73,6 +75,18 @@ pub fn start() {
                     }
                     let inbox: Inbox = Inbox::default();
                     let mut app = DesignApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
+                    let mut startup_files = 0usize;
+                    let mut startup_faces = 0u64;
+                    for (_name, bytes) in startup_fonts {
+                        let b64 = designcraft_engine::cmd::base64_encode(&bytes);
+                        if let Ok(v) = app.run("font.add", serde_json::json!({"base64": b64})) {
+                            startup_files += 1;
+                            startup_faces += v["added"].as_u64().unwrap_or(0);
+                        }
+                    }
+                    if startup_files > 0 {
+                        log::info!("designcraft-web: preloaded {startup_faces} font face(s) from {startup_files} font files");
+                    }
                     if has_query_flag(&query(), "sample") {
                         let _ = app.run("file.newSample", serde_json::json!({}));
                     }
@@ -357,18 +371,28 @@ impl eframe::App for WebShell {
         let _ = self.graphics.run_if_healthy(|| {
             // Dropped files belong to this host iteration's raw input, not to stale logic input:
             // read them here once, before the batch is saved as pending for a hidden pass.
-            for f in std::mem::take(&mut raw.dropped_files) {
+            let dropped = std::mem::take(&mut raw.dropped_files);
+            if !dropped.is_empty() {
                 let request = self.app.import_request("drop");
                 let inbox = self.inbox.clone();
                 let ctx = ctx.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
-                    match f.bytes_async().await {
-                        Ok(bytes) => {
-                            inbox.lock().unwrap_or_else(|e| e.into_inner()).push(ImportedFile { request, name, bytes });
-                            ctx.request_repaint();
+                    let mut loaded = Vec::with_capacity(dropped.len());
+                    for f in dropped {
+                        let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
+                        match f.bytes_async().await {
+                            Ok(bytes) => {
+                                if is_font_name(&name) {
+                                    persist_user_font(&name, &bytes).await;
+                                }
+                                loaded.push(ImportedFile { request: request.clone(), name, bytes });
+                            }
+                            Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
                         }
-                        Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
+                    }
+                    if !loaded.is_empty() {
+                        inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(loaded);
+                        ctx.request_repaint();
                     }
                 });
             }
@@ -392,6 +416,26 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
         open_async: Some(Box::new(move |request: ImportRequest| {
             let inbox = open_inbox.clone();
             let ctx = ctx.clone();
+            if request.purpose == "fonts" {
+                let dialog = rfd::AsyncFileDialog::new().add_filter("Fonts (.ttf, .otf, .ttc, .otc)", FONT_EXTS);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let Some(files) = dialog.pick_files().await else {
+                        return;
+                    };
+                    let mut loaded = Vec::with_capacity(files.len());
+                    for file in files {
+                        let name = file.file_name();
+                        let bytes = file.read().await;
+                        persist_user_font(&name, &bytes).await;
+                        loaded.push(ImportedFile { request: request.clone(), name, bytes });
+                    }
+                    if !loaded.is_empty() {
+                        inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(loaded);
+                        ctx.request_repaint();
+                    }
+                });
+                return;
+            }
             let dialog = if request.purpose == "swatches" {
                 rfd::AsyncFileDialog::new().add_filter("Swatch Exchange (ASE)", &["ase"])
             } else if request.purpose == "shortcuts" {
@@ -447,4 +491,126 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
         log::warn!("could not schedule revoking the download URL: {}", js(e));
     }
     Ok(())
+}
+
+const FONT_CACHE_NAME: &str = "designcraft-user-fonts-v1";
+const FONT_CACHE_PREFIX: &str = "/__designcraft_user_fonts__/";
+
+fn is_font_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    FONT_EXTS.iter().any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
+    let window = web_sys::window()?;
+    let fetch_fn = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("fetch")).ok()?.dyn_into::<js_sys::Function>().ok()?;
+    let resp_promise = fetch_fn.call1(&window, &wasm_bindgen::JsValue::from_str(url)).ok()?.dyn_into::<js_sys::Promise>().ok()?;
+    let resp = wasm_bindgen_futures::JsFuture::from(resp_promise).await.ok()?;
+    let ok = js_sys::Reflect::get(&resp, &wasm_bindgen::JsValue::from_str("ok")).ok()?.as_bool().unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let ab_fn = js_sys::Reflect::get(&resp, &wasm_bindgen::JsValue::from_str("arrayBuffer")).ok()?.dyn_into::<js_sys::Function>().ok()?;
+    let ab_promise = ab_fn.call0(&resp).ok()?.dyn_into::<js_sys::Promise>().ok()?;
+    let ab = wasm_bindgen_futures::JsFuture::from(ab_promise).await.ok()?;
+    Some(js_sys::Uint8Array::new(&ab).to_vec())
+}
+
+async fn open_font_cache() -> Option<wasm_bindgen::JsValue> {
+    let window = web_sys::window()?;
+    let caches = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("caches")).ok()?;
+    if caches.is_undefined() || caches.is_null() {
+        return None;
+    }
+    let open_fn = js_sys::Reflect::get(&caches, &wasm_bindgen::JsValue::from_str("open")).ok()?.dyn_into::<js_sys::Function>().ok()?;
+    let promise = open_fn.call1(&caches, &wasm_bindgen::JsValue::from_str(FONT_CACHE_NAME)).ok()?.dyn_into::<js_sys::Promise>().ok()?;
+    wasm_bindgen_futures::JsFuture::from(promise).await.ok()
+}
+
+async fn persist_user_font(name: &str, bytes: &[u8]) {
+    let Some(window) = web_sys::window() else { return };
+    let Some(cache) = open_font_cache().await else { return };
+    let Ok(resp_ctor) = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("Response")).and_then(|v| v.dyn_into::<js_sys::Function>())
+    else {
+        return;
+    };
+    let u8_arr = js_sys::Uint8Array::from(bytes);
+    let args = js_sys::Array::of1(&u8_arr);
+    let Ok(response) = js_sys::Reflect::construct(&resp_ctor, &args) else { return };
+    let Ok(put_fn) = js_sys::Reflect::get(&cache, &wasm_bindgen::JsValue::from_str("put")).and_then(|v| v.dyn_into::<js_sys::Function>()) else {
+        return;
+    };
+    let encoded = String::from(js_sys::encode_uri_component(name));
+    let key = wasm_bindgen::JsValue::from_str(&format!("{FONT_CACHE_PREFIX}{encoded}"));
+    if let Ok(promise) = put_fn.call2(&cache, &key, &response).and_then(|v| v.dyn_into::<js_sys::Promise>()) {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
+async fn load_cached_user_fonts() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some(cache) = open_font_cache().await else { return out };
+    let Ok(keys_fn) = js_sys::Reflect::get(&cache, &wasm_bindgen::JsValue::from_str("keys")).and_then(|v| v.dyn_into::<js_sys::Function>()) else {
+        return out;
+    };
+    let Ok(keys_promise) = keys_fn.call0(&cache).and_then(|v| v.dyn_into::<js_sys::Promise>()) else {
+        return out;
+    };
+    let Ok(keys_val) = wasm_bindgen_futures::JsFuture::from(keys_promise).await else {
+        return out;
+    };
+    let Ok(match_fn) = js_sys::Reflect::get(&cache, &wasm_bindgen::JsValue::from_str("match")).and_then(|v| v.dyn_into::<js_sys::Function>()) else {
+        return out;
+    };
+    let keys = js_sys::Array::from(&keys_val);
+    for req in keys.iter() {
+        let url = js_sys::Reflect::get(&req, &wasm_bindgen::JsValue::from_str("url")).ok().and_then(|v| v.as_string()).unwrap_or_default();
+        let name = url
+            .rsplit_once('/')
+            .and_then(|(_, last)| js_sys::decode_uri_component(last).ok().map(String::from))
+            .unwrap_or_else(|| "cached-font.ttf".into());
+        let Ok(m_promise) = match_fn.call1(&cache, &req).and_then(|v| v.dyn_into::<js_sys::Promise>()) else {
+            continue;
+        };
+        let Ok(resp) = wasm_bindgen_futures::JsFuture::from(m_promise).await else { continue };
+        if resp.is_undefined() || resp.is_null() {
+            continue;
+        }
+        let Ok(ab_fn) = js_sys::Reflect::get(&resp, &wasm_bindgen::JsValue::from_str("arrayBuffer")).and_then(|v| v.dyn_into::<js_sys::Function>())
+        else {
+            continue;
+        };
+        let Ok(ab_promise) = ab_fn.call0(&resp).and_then(|v| v.dyn_into::<js_sys::Promise>()) else {
+            continue;
+        };
+        if let Ok(ab) = wasm_bindgen_futures::JsFuture::from(ab_promise).await {
+            let bytes = js_sys::Uint8Array::new(&ab).to_vec();
+            if !bytes.is_empty() {
+                out.push((name, bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Preloads user fonts persisted in browser CacheStorage and any bundled server fonts listed in
+/// `fonts/manifest.json` so opening documents never prompts to reload fonts.
+async fn preload_web_fonts() -> Vec<(String, Vec<u8>)> {
+    let mut fonts = load_cached_user_fonts().await;
+    let loaded_names: std::collections::HashSet<String> = fonts.iter().map(|(n, _)| n.clone()).collect();
+    if let Some(manifest_bytes) = fetch_bytes("fonts/manifest.json").await
+        && let Ok(names) = serde_json::from_slice::<Vec<String>>(&manifest_bytes)
+    {
+        for name in names {
+            if loaded_names.contains(&name) {
+                continue;
+            }
+            let encoded = String::from(js_sys::encode_uri_component(&name));
+            if let Some(bytes) = fetch_bytes(&format!("fonts/{encoded}")).await {
+                persist_user_font(&name, &bytes).await;
+                fonts.push((name, bytes));
+            }
+        }
+    }
+    fonts
 }

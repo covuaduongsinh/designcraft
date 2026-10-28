@@ -172,14 +172,12 @@ pub fn sel_info(app: &DesignApp) -> Option<SelInfo> {
     let mut b: Option<Rect> = None;
     for id in &st.selection.items {
         let it = d.item(*id)?;
+        let full = d.find(*id).map_or(designcraft_geom::Affine::IDENTITY, |l| d.parent_xf(&l));
         // Direct Selection of a placed graphic: its bounds, as the Transform fields then set.
         let ib = match it.graphic() {
-            Some(g) if st.selection.content => {
-                let full = d.find(*id).map_or(designcraft_geom::Affine::IDENTITY, |l| d.parent_xf(&l));
-                (full * it.xf * g.xf).transform_rect_bbox(Rect::new(0.0, 0.0, g.size.0, g.size.1))
-            }
-            _ if with_stroke => it.visible_bounds(),
-            _ => it.bounds(),
+            Some(g) if st.selection.content => (full * it.xf * g.xf).transform_rect_bbox(Rect::new(0.0, 0.0, g.size.0, g.size.1)),
+            _ if with_stroke => full.transform_rect_bbox(it.visible_bounds()),
+            _ => full.transform_rect_bbox(it.bounds()),
         };
         b = Some(b.map_or(ib, |r| r.union(ib)));
     }

@@ -129,9 +129,14 @@ pub(super) fn context_menu(app: &mut DesignApp, ui: &egui::Ui, resp: &egui::Resp
 /// - On nothing: the selection stays.
 fn context_target(app: &mut DesignApp, p: Point, zoom: f64) -> crate::menus::ContextMenu {
     use crate::menus::ContextMenu;
+    let tol = 4.0 / zoom.max(1e-6);
     let hit = item_at(app, p, zoom);
     if app.session.wants_text() {
-        let text_frame = hit.filter(|(id, _)| app.session.active().and_then(|st| st.doc.item(*id)).is_some_and(Item::is_text_frame));
+        let text_frame = hit.and_then(|(id, sp)| {
+            let st = app.session.active()?;
+            let it = st.doc.item(id)?;
+            Some((designcraft_doc::hit_descendant(it, sp, tol, &Item::is_text_frame)?, sp))
+        });
         if let Some((id, sp)) = text_frame {
             // A press in the selected text keeps it for dragging; end that press without a move.
             if app.run("text.placeCaret", json!({"frame": id.0, "point": [sp.x, sp.y]})).is_ok_and(|r| r["dragging"] == json!(true)) {
@@ -140,10 +145,15 @@ fn context_target(app: &mut DesignApp, p: Point, zoom: f64) -> crate::menus::Con
         }
         return ContextMenu::Text;
     }
-    let Some((id, _)) = hit else { return ContextMenu::Canvas };
+    let Some((id, sp)) = hit else { return ContextMenu::Canvas };
     let direct = app.session.tool_id() == "directSelection";
     let Some((target, selected)) = app.session.active().map(|st| {
-        let target = if direct { id } else { st.doc.top_level_of(id).unwrap_or(id) };
+        let leaf = st.doc.item(id).and_then(|it| designcraft_doc::hit_descendant(it, sp, tol, &|c| !c.is_group()));
+        let target = if direct {
+            leaf.unwrap_or(id)
+        } else {
+            leaf.filter(|l| st.selection.contains(*l)).unwrap_or_else(|| st.doc.top_level_of(id).unwrap_or(id))
+        };
         (target, st.selection.contains(target))
     }) else {
         return ContextMenu::Canvas;

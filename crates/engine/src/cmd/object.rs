@@ -77,6 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let c = union_bounds(d, &ids).center();
                 let m = Affine::translate(c.to_vec2()) * Affine::scale_non_uniform(sx, sy) * Affine::translate(-c.to_vec2());
                 for id in &ids {
+                    let m = in_parent_space(d, *id, m);
                     scale_object(d, *id, m, (sx * sy).abs().sqrt(), strokes);
                 }
                 ok()
@@ -1233,6 +1234,7 @@ fn transform_resize(s: &mut Session, p: &Value) -> Result<Value> {
     let strokes = s.prefs.scale_strokes;
     s.edit(|d, _| {
         for id in &ids {
+            let m = in_parent_space(d, *id, m);
             let it = d.item_mut(*id).ok_or(designcraft_doc::DocError::NoItem(*id))?;
             if it.locked {
                 continue;
@@ -1280,8 +1282,20 @@ fn resize_container(it: &mut Item, m: Affine) {
     }
 }
 
+fn in_parent_space(d: &Document, id: ItemId, m: Affine) -> Affine {
+    let p = d.find(id).map_or(Affine::IDENTITY, |l| d.parent_xf(&l));
+    if p.determinant().abs() > 1e-12 { p.inverse() * m * p } else { m }
+}
+
 fn union_bounds(d: &Document, ids: &[ItemId]) -> Rect {
-    ids.iter().filter_map(|i| d.item(*i)).map(Item::bounds).reduce(|a, b| a.union(b)).unwrap_or(Rect::ZERO)
+    ids.iter()
+        .filter_map(|i| {
+            let it = d.item(*i)?;
+            let p = d.find(*i).map_or(Affine::IDENTITY, |l| d.parent_xf(&l));
+            Some(p.transform_rect_bbox(it.bounds()))
+        })
+        .reduce(|a, b| a.union(b))
+        .unwrap_or(Rect::ZERO)
 }
 
 /// Transform an item's geometry in its own space: the path and the gradient vectors (fill and
@@ -1492,6 +1506,7 @@ fn apply_about_ref(s: &mut Session, p: &Value, a: Affine) -> Result<Value> {
         let c = designcraft_geom::reference_point(union_bounds(d, &ids), rf);
         let m = Affine::translate(c.to_vec2()) * a * Affine::translate(-c.to_vec2());
         for id in &ids {
+            let m = in_parent_space(d, *id, m);
             if let Some(it) = d.item_mut(*id) {
                 it.xf = m * it.xf;
             }
@@ -1619,7 +1634,14 @@ fn transform_set(s: &mut Session, p: &Value) -> Result<Value> {
         // the geometry it pads.
         let geom = union_bounds(d, &ids);
         let from = if with_stroke {
-            ids.iter().filter_map(|i| d.item(*i)).map(Item::visible_bounds).reduce(|a, b| a.union(b)).unwrap_or(geom)
+            ids.iter()
+                .filter_map(|i| {
+                    let it = d.item(*i)?;
+                    let p = d.find(*i).map_or(Affine::IDENTITY, |l| d.parent_xf(&l));
+                    Some(p.transform_rect_bbox(it.visible_bounds()))
+                })
+                .reduce(|a, b| a.union(b))
+                .unwrap_or(geom)
         } else {
             geom
         };
@@ -1644,6 +1666,7 @@ fn transform_set(s: &mut Session, p: &Value) -> Result<Value> {
             * Affine::scale_non_uniform(to.width() / geom.width().max(1e-9), to.height() / geom.height().max(1e-9))
             * Affine::translate((-geom.x0, -geom.y0));
         for id in &ids {
+            let m = in_parent_space(d, *id, m);
             if let Some(it) = d.item_mut(*id) {
                 if it.flex.is_some() {
                     resize_container(it, m);

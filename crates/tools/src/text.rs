@@ -62,7 +62,7 @@ struct BorderDrag {
 
 /// The row or column border of a table near canvas point `pos`, in an unlocked text frame.
 fn border_at(cx: &ToolContext, pos: Point) -> Option<BorderDrag> {
-    let (_, id) = cx.hit(pos)?;
+    let (_, id) = cx.hit_text_frame(pos)?;
     let it = cx.doc.item(id)?;
     if it.locked {
         return None;
@@ -234,13 +234,19 @@ impl TypeTool {
             self.border = Some(b);
             return vec![];
         }
-        // Text frames take the caret (locked ones too, as in InDesign); an empty frame
-        // becomes one, unless it's locked: then the press draws a new text frame over it.
-        if let Some((_, id)) = cx.hit(ev.pos)
-            && let Some(it) = cx.doc.item(id)
-            && !matches!(it.content, designcraft_doc::Content::Graphic(_) | designcraft_doc::Content::Group { .. })
-            && (it.is_text_frame() || !it.locked)
-        {
+        // Text frames take the caret (locked ones too, and inside groups or under lines, as in
+        // InDesign); an empty closed frame becomes one, unless it's locked: then the press draws
+        // a new text frame over it.
+        let target = cx.hit_text_frame(ev.pos).map(|(_, id)| id).or_else(|| {
+            let (_, id) = cx.hit(ev.pos)?;
+            let it = cx.doc.item(id)?;
+            (matches!(it.content, designcraft_doc::Content::Unassigned)
+                && it.path.is_closed()
+                && it.shape != designcraft_doc::Shape::GraphicLine
+                && !it.locked)
+                .then_some(id)
+        });
+        if let Some(id) = target {
             let sp = cx.layout.spread_at(ev.pos).map(|(_, p)| p).unwrap_or(ev.pos);
             let clicks = ev.click_count();
             // Whole rows/columns selected: wait to see whether this is a drag.

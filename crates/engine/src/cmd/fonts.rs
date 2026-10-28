@@ -35,7 +35,38 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             reload
         ),
+        cmd!(
+            noundo "font.add",
+            "Add Font…",
+            [],
+            None,
+            "{path?|base64?} — adds a font file (.ttf, .otf, .ttc, .otc) to the shared font database and recomposes the open documents → {added}",
+            always,
+            add_font
+        ),
     ]
+}
+
+/// Add a user font file (by path or base64 bytes) to the shared font database and recompose all
+/// open documents.
+fn add_font(s: &mut Session, p: &Value) -> Result<Value> {
+    let bytes = match (str_param(p, "path"), str_param(p, "base64")) {
+        (_, Some(b)) => crate::cmd::file::base64_decode(b),
+        (Some(path), None) => crate::io::read_capped(path, designcraft_fonts::MAX_DOCUMENT_FONT_BYTES).map_err(|e| bad("font.add", e.to_string()))?,
+        _ => return Err(bad("font.add", "give `path` or `base64`")),
+    };
+    if bytes.len() as u64 > designcraft_fonts::MAX_DOCUMENT_FONT_BYTES {
+        return Err(bad("font.add", format!("font file is larger than {} MB", designcraft_fonts::MAX_DOCUMENT_FONT_BYTES >> 20)));
+    }
+    if designcraft_fonts::line_metrics(&bytes, 0).is_none() {
+        return Err(bad("font.add", "not a font DesignCraft can read"));
+    }
+    let added = designcraft_fonts::FontDb::global().add_font(bytes);
+    s.cache = Arc::new(designcraft_compose::Cache::new());
+    for st in &mut s.docs {
+        st.bump_revision();
+    }
+    Ok(json!({"added": added}))
 }
 
 /// Fonts installed, edited or removed while the app runs (#328, #547): the font database reads
@@ -274,6 +305,20 @@ mod tests {
         let st = s.doc().unwrap();
         assert_ne!(st.revision, revision, "the canvas draws the document again");
         assert_eq!(st.history.undo.len(), undo, "reloading fonts isn't an edit");
+    }
+
+    #[test]
+    fn add_font_rejects_invalid_bytes_and_recomposes_on_valid_font() {
+        let mut s = Session::new();
+        assert!(s.execute("font.add", &json!({})).is_err());
+        assert!(s.execute("font.add", &json!({"base64": "bm90IGEgZm9udA=="})).is_err());
+        s.execute("file.new", &json!({})).unwrap();
+        let revision = s.doc().unwrap().revision;
+        let bundled = designcraft_fonts::bundled()[0];
+        let b64 = crate::cmd::file::base64_encode(bundled);
+        let r = s.execute("font.add", &json!({"base64": b64})).unwrap();
+        assert!(r["added"].is_u64(), "{r}");
+        assert_ne!(s.doc().unwrap().revision, revision);
     }
 
     #[test]

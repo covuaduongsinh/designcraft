@@ -7336,12 +7336,30 @@ fn find_font(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
         crate::rtl::label(ui, d.s("error"));
     }
     let missing = fonts.iter().filter(|f| f["missing"] == true || f["styleMissing"] == true).count();
-    crate::rtl::label(
-        ui,
-        crate::i18n::tr(&app.ui.language, "Fonts in Document: {count}    Missing: {missing}")
-            .replace("{count}", &fonts.len().to_string())
-            .replace("{missing}", &missing.to_string()),
-    );
+    ui.horizontal(|ui| {
+        crate::rtl::label(
+            ui,
+            crate::i18n::tr(&app.ui.language, "Fonts in Document: {count}    Missing: {missing}")
+                .replace("{count}", &fonts.len().to_string())
+                .replace("{missing}", &missing.to_string()),
+        );
+        ui.add_space(12.0);
+        if ui
+            .button(crate::i18n::tr(&app.ui.language, "Add Fonts…"))
+            .on_hover_text(crate::i18n::tr(&app.ui.language, "Select one or more .ttf, .otf, .ttc or .otc font files (or drag and drop them here)"))
+            .clicked()
+        {
+            let _ = app.pick_and_open("fonts");
+            d.fields.remove("_fonts");
+        }
+    });
+    if !ui.ctx().input(|i| i.raw.hovered_files.is_empty()) {
+        crate::rtl::label(
+            ui,
+            egui::RichText::new(crate::i18n::tr(&app.ui.language, "Drop font files (.ttf, .otf, .ttc, .otc) anywhere to load them"))
+                .color(crate::theme::Tokens::get(ui.ctx()).accent_strong),
+        );
+    }
     egui::ScrollArea::vertical().id_salt("ff_list").max_height(180.0).show(ui, |ui| {
         for f in &fonts {
             let (fam, st) = (f["family"].as_str().unwrap_or(""), f["style"].as_str().unwrap_or(""));

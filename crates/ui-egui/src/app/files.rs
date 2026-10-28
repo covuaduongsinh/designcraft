@@ -46,6 +46,28 @@ impl DesignApp {
                     }
                 }
                 Some(path) if purpose == "place" => self.place_file(json!({"path": path})),
+                Some(paths) if purpose == "fonts" => {
+                    let mut files = 0usize;
+                    let mut faces = 0u64;
+                    let mut last = Ok(Value::Null);
+                    for path in paths.lines().filter(|p| !p.is_empty()) {
+                        match self.run("font.add", json!({"path": path})) {
+                            Ok(v) => {
+                                files += 1;
+                                faces += v["added"].as_u64().unwrap_or(0);
+                                last = Ok(v);
+                            }
+                            Err(e) => last = Err(e),
+                        }
+                    }
+                    if files > 1 {
+                        self.status(format!("Loaded {faces} font face(s) from {files} font files"));
+                    } else if files == 1 {
+                        let name = std::path::Path::new(paths.trim()).file_name().map_or(paths.trim(), |n| n.to_str().unwrap_or(paths.trim()));
+                        self.status(format!("{name}: loaded {faces} font face(s)"));
+                    }
+                    last
+                }
                 Some(path) => self.open_file("file.open", json!({"path": path})),
                 None => Ok(Value::Null),
             };
@@ -123,9 +145,28 @@ impl DesignApp {
         }
         let Some(inbox) = self.services.inbox.clone() else { return };
         let files = std::mem::take(&mut *inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let mut font_files_loaded = 0usize;
+        let mut font_faces_loaded = 0u64;
+        let mut last_font_status = None;
         for file in files {
             if file.request.purpose == "shortcuts" {
                 shortcut_import::import_delivered(self, &file.bytes);
+                continue;
+            }
+            if file.request.purpose == "fonts" || is_font_file(&file.name, &file.bytes) {
+                let name = file.name.clone();
+                let b64 = designcraft_engine::cmd::base64_encode(&file.bytes);
+                match self.run("font.add", json!({"base64": b64})) {
+                    Ok(v) => {
+                        let added = v["added"].as_u64().unwrap_or(0);
+                        font_files_loaded += 1;
+                        font_faces_loaded += added;
+                        last_font_status = Some(format!("{name}: loaded {added} font face(s)"));
+                    }
+                    Err(e) => {
+                        last_font_status = Some(format!("{name}: {e}"));
+                    }
+                }
                 continue;
             }
             if self.ui.dialog.is_some() {
@@ -139,6 +180,11 @@ impl DesignApp {
             if let Err(e) = self.import_file(file) {
                 self.status(format!("{name}: {e}"));
             }
+        }
+        if font_files_loaded > 1 {
+            self.status(format!("Loaded {font_faces_loaded} font face(s) from {font_files_loaded} font files"));
+        } else if let Some(msg) = last_font_status {
+            self.status(msg);
         }
     }
 
@@ -206,8 +252,12 @@ impl DesignApp {
     /// [`Self::open_dropped`] at the pointer: a graphic's top left lands where the file was
     /// dropped on the canvas, text goes to a new frame on the document page there.
     pub fn open_dropped_at(&mut self, path: &str, pointer: Option<egui::Pos2>) -> Result<Value, String> {
-        if path.to_ascii_lowercase().ends_with(".ase") {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".ase") {
             return self.run("swatch.load", json!({"path": path}));
+        }
+        if lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".ttc") || lower.ends_with(".otc") {
+            return self.run("font.add", json!({"path": path}));
         }
         let document = opens_as_document(path)
             || (std::path::Path::new(path).extension().is_none()
@@ -309,6 +359,14 @@ impl DesignApp {
 pub fn opens_as_document(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     [".designcraft", ".idml", ".indd", ".indt"].iter().any(|ext| n.ends_with(ext))
+}
+
+/// True when `name` has a font file extension (`.ttf`, `.otf`, `.ttc`, `.otc`) or has no extension
+/// and `bytes` is a readable OpenType/TrueType font.
+pub fn is_font_file(name: &str, bytes: &[u8]) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".ttf", ".otf", ".ttc", ".otc"].iter().any(|ext| n.ends_with(ext))
+        || (std::path::Path::new(name).extension().is_none() && designcraft_fonts::line_metrics(bytes, 0).is_some())
 }
 
 #[cfg(test)]
@@ -716,6 +774,27 @@ pub(crate) mod browser_import_tests {
         assert!(dialogs::confirm(&mut app).is_err());
         assert!(app.pending_pdf.is_none());
         assert!(app.session.doc().unwrap().doc.assets.is_empty());
+    }
+
+    #[test]
+    fn multiple_fonts_picked_or_dropped_load_while_find_font_dialog_is_open() {
+        let mut app = app();
+        let font_bytes = designcraft_fonts::bundled().first().unwrap().to_vec();
+        for purpose in ["fonts", "drop"] {
+            app.ui.dialog = Some(dialogs::Dialog::new("findFont", json!({"_fonts": [{"family": "Missing", "style": "Regular", "missing": true}]})));
+            let request = app.import_request(purpose);
+            {
+                let mut q = app.services.inbox.as_ref().unwrap().lock().unwrap();
+                q.push(ImportedFile { request: request.clone(), name: "FontA.ttf".into(), bytes: font_bytes.clone() });
+                q.push(ImportedFile { request, name: "FontB.otf".into(), bytes: font_bytes.clone() });
+            }
+            app.drain_inbox();
+            assert_eq!(app.ui.status, "Loaded 2 font face(s) from 2 font files");
+            assert!(
+                !app.ui.dialog.as_ref().unwrap().fields.contains_key("_fonts"),
+                "findFont dialog cache must be cleared so missing font list refreshes"
+            );
+        }
     }
 }
 

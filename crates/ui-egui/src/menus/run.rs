@@ -385,6 +385,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             app.ui.dialog = Some(crate::dialogs::Dialog::new("findFont", json!({})));
             Ok(Value::Null)
         }
+        "app.addFontsDialog" => app.pick_and_open("fonts"),
         "app.insertXrefDialog" => {
             if app.session.active().is_none_or(|d| d.selection.text.is_none()) {
                 return Some(Err("place the insertion point in text to insert a cross-reference".into()));

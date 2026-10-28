@@ -225,6 +225,7 @@ struct OpenFilter {
 fn open_filters(purpose: &str) -> &'static [OpenFilter] {
     match purpose {
         "swatches" => &[OpenFilter { name: "Swatch Exchange (ASE)", extensions: &["ase"] }],
+        "fonts" => &[OpenFilter { name: "Fonts (.ttf, .otf, .ttc, .otc)", extensions: &["ttf", "otf", "ttc", "otc"] }],
         "script" => &[OpenFilter { name: "Script", extensions: &["dcscript", "txt", "json"] }],
         "shortcuts" => &[OpenFilter { name: "Shortcut set (JSON, InDesign text)", extensions: &["json", "txt"] }],
         "icc" => &[OpenFilter { name: "ICC profile", extensions: &["icc", "icm"] }],
@@ -364,7 +365,11 @@ fn services() -> Services {
             for filter in open_filters(purpose) {
                 dialog = dialog.add_filter(filter.name, filter.extensions);
             }
-            dialog.pick_file().map(|p| p.to_string_lossy().to_string())
+            if purpose == "fonts" {
+                dialog.pick_files().map(|paths| paths.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"))
+            } else {
+                dialog.pick_file().map(|p| p.to_string_lossy().to_string())
+            }
         })),
         pick_save: Some(Box::new(pick_save)),
         read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),

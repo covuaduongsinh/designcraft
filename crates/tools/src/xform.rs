@@ -337,14 +337,16 @@ impl Tool for EyedropperTool {
             }
             return vec![Action::Exec("color.sample".into(), p)];
         }
-        let Some((sr, id)) = hit else { return vec![] };
+        let Some((_, id)) = hit else { return vec![] };
         if !selected {
             return vec![Action::Exec("selection.set".into(), json!({"ids": [id.0]}))];
         }
         // With text selected, clicking text picks up its formatting (InDesign's Eyedropper).
-        if cx.selection.text.is_some() && cx.doc.item(id).is_some_and(|it| it.is_text_frame()) {
+        if cx.selection.text.is_some()
+            && let Some((sr, tf)) = cx.hit_text_frame(ev.pos)
+        {
             let p = cx.layout.to_spread(sr, ev.pos);
-            return vec![Action::Exec("type.pickUpFormat".into(), json!({"frame": id.0, "point": [p.x, p.y]}))];
+            return vec![Action::Exec("type.pickUpFormat".into(), json!({"frame": tf.0, "point": [p.x, p.y]}))];
         }
         vec![Action::Exec("object.matchAttributes".into(), json!({"from": id.0}))]
     }

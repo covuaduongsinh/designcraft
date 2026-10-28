@@ -719,6 +719,18 @@ impl Tool for SelectionTool {
             self.drag = Drag::None;
             return actions;
         }
+        // The second press of a double click on a group: select the object inside it under the
+        // pointer (or toggle content when that object is already selected and holds content).
+        if !self.direct
+            && matches!(ev.kind, PointerKind::Down | PointerKind::DoubleClick)
+            && ev.click_count() == 2
+            && let Some((_, leaf)) = cx.hit_leaf(p)
+            && cx.doc.top_level_of(leaf) != Some(leaf)
+        {
+            self.drag = Drag::None;
+            let content = cx.selection.contains(leaf) && cx.doc.item(leaf).is_some_and(holds_content) && !cx.selection.content;
+            return vec![Action::Exec("selection.set".into(), json!({"ids": [leaf.0], "content": content}))];
+        }
         // The second press of a double click on a frame with content: toggle between the frame and
         // its content.
         if !self.direct
@@ -816,9 +828,16 @@ impl Tool for SelectionTool {
                     self.drag = Drag::Pending { start: p, hit: true, content: false };
                     return vec![Action::Exec("layout.overrideParentItems".into(), json!({"page": page, "ids": [id.0]}))];
                 }
-                match cx.hit(p) {
+                let hit = if self.direct { cx.hit_leaf(p) } else { cx.hit(p) };
+                match hit {
                     Some((sr, id)) => {
-                        let id = if self.direct { id } else { cx.doc.top_level_of(id).unwrap_or(id) };
+                        let id = if self.direct {
+                            id
+                        } else if let Some((_, leaf)) = cx.hit_leaf(p).filter(|(_, l)| cx.selection.contains(*l)) {
+                            leaf
+                        } else {
+                            cx.doc.top_level_of(id).unwrap_or(id)
+                        };
                         let mut out = vec![];
                         if ev.mods.shift {
                             if cx.selection.contains(id) {
@@ -1326,10 +1345,7 @@ fn handle_cursor(h: usize) -> Cursor {
 
 /// Switch to the Type tool with the caret at `p` when it is over a text frame.
 fn edit_text_at(cx: &ToolContext, p: Point) -> Option<Vec<Action>> {
-    let (_, id) = cx.hit(p)?;
-    if !cx.doc.item(id).is_some_and(|i| i.is_text_frame()) {
-        return None;
-    }
+    let (_, id) = cx.hit_text_frame(p)?;
     let (_, sp) = cx.layout.spread_at(p).unwrap_or((SpreadRef::Doc(0), p));
     Some(vec![Action::SwitchTool("type".into()), Action::Exec("text.placeCaret".into(), json!({"frame": id.0, "point": [sp.x, sp.y]}))])
 }

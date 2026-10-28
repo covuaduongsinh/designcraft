@@ -1966,3 +1966,82 @@ fn loaded_text_cursor_threads_into_a_frame_inside_a_group() {
     assert_eq!(cx2.hit_text_frame(q).map(|(_, i)| i), None, "no text frame in that group");
     assert_eq!(t2.cursor(&cx2, q, Mods::default()), Cursor::NotAllowed);
 }
+
+#[test]
+fn grouped_text_frame_under_line_is_editable_with_type_and_selection_tools() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    // Create a text frame in local group coordinates (-400.. -200, 0..100), then place it inside
+    // a group translated by (+500, +100) so it appears at (100..300, 100..200) on the spread.
+    let (tf_id, _) = d.add_text_frame(SpreadRef::Doc(0), Rect::new(-400.0, 0.0, -200.0, 100.0), lid, "Hình 24.1", ParaFormat::default()).unwrap();
+    let tf_item = d.item(tf_id).cloned().unwrap();
+    d.remove_item(tf_id).unwrap();
+    let gid = ItemId(d.alloc());
+    let mut group = Item::new(gid, lid, Shape::Group, shapes::rectangle(Rect::new(-400.0, 0.0, -200.0, 100.0)));
+    group.xf = designcraft_geom::Affine::translate((500.0, 100.0));
+    group.content = designcraft_doc::Content::Group { items: vec![std::sync::Arc::new(tf_item)] };
+    d.insert_item(SpreadRef::Doc(0), group, None).unwrap();
+    // Place an open GraphicLine on top of the group at y = 120.
+    let line_id = ItemId(d.alloc());
+    let line = Item::new(line_id, lid, Shape::GraphicLine, shapes::line(Point::new(90.0, 120.0), Point::new(310.0, 120.0)));
+    d.insert_item(SpreadRef::Doc(0), line, None).unwrap();
+
+    let (s, c, l) = (Selection::default(), Cache::new(), CanvasLayout::new(&d, false));
+    let cx = ctx(&d, &s, &c, &l);
+    let p = spread_pt(&l, 150.0, 120.0);
+
+    // Type tool clicks through the open line and into the group's text frame.
+    let mut tt = create("type");
+    let a = tt.pointer(&cx, &PointerEvent::new(PointerKind::Down, p.x, p.y));
+    assert!(matches!(&a[..], [Action::Exec(cmd, q)] if cmd == "text.placeCaret" && q["frame"] == tf_id.0), "{a:?}");
+    let a2 = tt.pointer(&cx, &PointerEvent::new(PointerKind::Down, p.x, p.y).with_clicks(2));
+    assert!(matches!(&a2[..], [Action::Exec(cmd, q)] if cmd == "text.selectAt" && q["frame"] == tf_id.0 && q["unit"] == "word"), "{a2:?}");
+
+    // Selection tool double-click on the group's text frame switches to the Type tool and places the caret.
+    let p_text = spread_pt(&l, 150.0, 150.0);
+    let mut st = create("selection");
+    let a_down1 = st.pointer(&cx, &PointerEvent::new(PointerKind::Down, p_text.x, p_text.y));
+    assert_eq!(a_down1, vec![Action::Exec("selection.set".into(), serde_json::json!({"ids": [gid.0], "content": false}))]);
+    st.pointer(&cx, &PointerEvent::new(PointerKind::Up, p_text.x, p_text.y));
+    let sel_gid = Selection::items(vec![gid]);
+    let cx_sel = ctx(&d, &sel_gid, &c, &l);
+    let a_dbl = st.pointer(&cx_sel, &PointerEvent::new(PointerKind::Down, p_text.x, p_text.y).with_clicks(2));
+    assert_eq!(a_dbl.first(), Some(&Action::SwitchTool("type".into())));
+    assert!(matches!(&a_dbl[1], Action::Exec(cmd, q) if cmd == "text.placeCaret" && q["frame"] == tf_id.0), "{a_dbl:?}");
+}
+
+#[test]
+fn double_click_or_direct_selection_selects_and_moves_group_child() {
+    let mut d = Document::new(&NewDocument::default());
+    let lid = d.default_layer();
+    let child_id = ItemId(d.alloc());
+    let child = Item::new(child_id, lid, Shape::Rectangle, shapes::rectangle(Rect::new(0.0, 0.0, 80.0, 60.0)));
+    let gid = ItemId(d.alloc());
+    let mut group = Item::new(gid, lid, Shape::Group, shapes::rectangle(Rect::new(0.0, 0.0, 80.0, 60.0)));
+    group.xf = designcraft_geom::Affine::translate((100.0, 100.0));
+    group.content = designcraft_doc::Content::Group { items: vec![std::sync::Arc::new(child)] };
+    d.insert_item(SpreadRef::Doc(0), group, None).unwrap();
+
+    let (c, l) = (Cache::new(), CanvasLayout::new(&d, false));
+    let p = spread_pt(&l, 120.0, 120.0);
+
+    // Direct Selection single-click picks the leaf inside the group.
+    let mut ds = create("directSelection");
+    let none = Selection::default();
+    let a = ds.pointer(&ctx(&d, &none, &c, &l), &PointerEvent::new(PointerKind::Down, p.x, p.y));
+    assert_eq!(a, vec![Action::Exec("selection.set".into(), serde_json::json!({"ids": [child_id.0], "content": true}))]);
+
+    // Selection tool double-click on a non-text group child selects the child item, and subsequent drag moves it.
+    let mut st = create("selection");
+    let sel_grp = Selection::items(vec![gid]);
+    let cx_grp = ctx(&d, &sel_grp, &c, &l);
+    let a_dbl = st.pointer(&cx_grp, &PointerEvent::new(PointerKind::Down, p.x, p.y).with_clicks(2));
+    assert_eq!(a_dbl, vec![Action::Exec("selection.set".into(), serde_json::json!({"ids": [child_id.0], "content": false}))]);
+    st.pointer(&cx_grp, &PointerEvent::new(PointerKind::Up, p.x, p.y));
+
+    let sel_child = Selection::items(vec![child_id]);
+    let cx_child = ctx(&d, &sel_child, &c, &l);
+    assert!(st.pointer(&cx_child, &PointerEvent::new(PointerKind::Down, p.x, p.y)).is_empty());
+    let drag = st.pointer(&cx_child, &PointerEvent::new(PointerKind::Drag, p.x + 20.0, p.y + 10.0));
+    assert_eq!(drag.first(), Some(&Action::Begin("Move".into())));
+}
